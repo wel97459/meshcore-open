@@ -29,14 +29,15 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
-        externalNativeBuild {
-            cmake {
-                arguments += listOf("-DANDROID_STL=c++_shared")
-            }
-        }
-        ndk {
-            abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86_64")
-        }
+        // Codec2 native build removed - no longer needed
+        // externalNativeBuild {
+        //     cmake {
+        //         arguments += listOf("-DANDROID_STL=c++_shared")
+        //     }
+        // }
+        // ndk {
+        //     abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86_64")
+        // }
     }
 
     buildTypes {
@@ -47,11 +48,12 @@ android {
         }
     }
 
-    externalNativeBuild {
-        cmake {
-            path = file("src/main/cpp/CMakeLists.txt")
-        }
-    }
+    // Codec2 native build removed - no longer needed
+    // externalNativeBuild {
+    //     cmake {
+    //         path = file("src/main/cpp/CMakeLists.txt")
+    //     }
+    // }
 }
 
 flutter {
