@@ -29,6 +29,7 @@ const int cmdGetContactByKey = 30;
 const int cmdGetChannel = 31;
 const int cmdSetChannel = 32;
 const int cmdGetRadioSettings = 57;
+const int cmdGetTelemetryReq = 39;
 
 // Text message types
 const int txtTypePlain = 0;
@@ -612,5 +613,23 @@ Uint8List buildSendCliCommandFrame(
 
   frame.setRange(offset, offset + textBytes.length, textBytes);
   frame[frame.length - 1] = 0; // null terminator
+  return frame;
+}
+
+//Build a telemetry request frame
+//Format: [cmd][reserved x3][pub_key x32]
+Uint8List buildSendTelemetryReq(
+  Uint8List repeaterPubKey,
+  {
+    int attempt = 0,
+    int? timestampSeconds,
+  }) {
+  int offset = 0;
+  final frame = Uint8List(1 + 1 + 1 + 1 + 32);
+  frame[offset++] = cmdGetTelemetryReq;
+  frame[offset++] = 0; // reserved
+  frame[offset++] = 0; // reserved
+  frame[offset++] = 0; // reserved
+  frame.setRange(offset, offset + 32, repeaterPubKey);
   return frame;
 }
