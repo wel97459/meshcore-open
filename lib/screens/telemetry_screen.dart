@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../models/contact.dart';
@@ -9,6 +10,7 @@ import '../connector/meshcore_connector.dart';
 import '../connector/meshcore_protocol.dart';
 import '../services/repeater_command_service.dart';
 import '../widgets/path_management_dialog.dart';
+import '../helpers/cayenne_lpp.dart';
 
 class TelemetryScreen extends StatefulWidget {
   final Contact repeater;
@@ -25,26 +27,144 @@ class TelemetryScreen extends StatefulWidget {
 }
 
 class _TelemetryScreenState extends State<TelemetryScreen> {
+  static const int _statusPayloadOffset = 8;
+  static const int _statusStatsSize = 52;
+  static const int _statusResponseBytes = _statusPayloadOffset + _statusStatsSize;
+  Uint8List _tagData = Uint8List(4);
+  int _timeEstment = 0;
+
   bool _isLoading = false;
   Timer? _statusTimeout;
+  StreamSubscription<Uint8List>? _frameSubscription;
+  RepeaterCommandService? _commandService;
+  PathSelection? _pendingStatusSelection;
 
   @override
   void initState() {
     super.initState();
     final connector = Provider.of<MeshCoreConnector>(context, listen: false);
-    // _commandService = RepeaterCommandService(connector);
-    // _setupMessageListener();
-    _loadStatus();
+    _commandService = RepeaterCommandService(connector);
+    _setupMessageListener();
+    _loadTelemetry();
   }
 
-  Future<void> _loadStatus() async {
+  void _setupMessageListener() {
+    final connector = Provider.of<MeshCoreConnector>(context, listen: false);
+
+    // Listen for incoming text messages from the repeater
+    _frameSubscription = connector.receivedFrames.listen((frame) {
+      if (frame.isEmpty) return;
+
+    if(frame[0] == respCodeSent){
+      _tagData = frame.sublist(2, 6);
+      _timeEstment = frame.buffer.asByteData().getUint32(6, Endian.little);
+    }
+
+    // Check if it's a binary response
+    if (frame[0] == pushCodeBinaryResponse && listEquals(frame.sublist(2, 6), _tagData)) {
+      _handleStatusResponse(context, frame.sublist(6));
+    }
+  });
+}
+
+  void _handleStatusResponse(BuildContext context, Uint8List frame) {
+
+    final parsedTelemetry = CayenneLpp.parse(frame);
+    for (final entry in parsedTelemetry) {
+      print('Telemetry - Channel: ${entry['channel']}, Type: ${entry['type']}, Value: ${entry['value']}');
+    }
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Received status response (not implemented).'),
+        backgroundColor: Colors.green,
+      )
+    );
+    _statusTimeout?.cancel();
+    if (!mounted) return;
+    setState(() {
+      _isLoading = false;
+    });
   }
 
-    Contact _resolveRepeater(MeshCoreConnector connector) {
+  Contact _resolveRepeater(MeshCoreConnector connector) {
     return connector.contacts.firstWhere(
       (c) => c.publicKeyHex == widget.repeater.publicKeyHex,
       orElse: () => widget.repeater,
     );
+  }
+
+  Future<void> _loadTelemetry() async {
+    if (_commandService == null) return;
+
+    setState(() {
+      _isLoading = true;
+    });
+    try {
+      final connector = Provider.of<MeshCoreConnector>(context, listen: false);
+      final repeater = _resolveRepeater(connector);
+      final selection = await connector.preparePathForContactSend(repeater);
+      _pendingStatusSelection = selection;
+      final frame = buildSendBinaryReq(repeater.publicKey, payload: Uint8List.fromList([reqTypeGetTelemetry]));
+      await connector.sendFrame(frame);
+
+      final pathLengthValue = selection.useFlood ? -1 : selection.hopCount;
+      final messageBytes = frame.length >= _statusResponseBytes
+          ? frame.length
+          : _statusResponseBytes;
+      final timeoutMs = connector.calculateTimeout(
+        pathLength: pathLengthValue,
+        messageBytes: messageBytes,
+      );
+      _statusTimeout?.cancel();
+      _statusTimeout = Timer(Duration(milliseconds: timeoutMs), () {
+        if (!mounted) return;
+        setState(() {
+          _isLoading = false;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Status request timed out.'),
+            backgroundColor: Colors.red,
+          ),
+        );
+        _recordStatusResult(false);
+      });
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error loading status: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    } finally {
+      setState(() {
+        _isLoading = false;
+      });
+    }
+  }
+
+  void _recordStatusResult(bool success) {
+    final selection = _pendingStatusSelection;
+    if (selection == null) return;
+    final connector = Provider.of<MeshCoreConnector>(context, listen: false);
+    final repeater = _resolveRepeater(connector);
+    connector.recordRepeaterPathResult(repeater, selection, success, null);
+    _pendingStatusSelection = null;
+  }
+
+  @override
+  void dispose() {
+    _frameSubscription?.cancel();
+    _commandService?.dispose();
+    _statusTimeout?.cancel();
+    super.dispose();
   }
 
   @override
@@ -124,7 +244,7 @@ class _TelemetryScreenState extends State<TelemetryScreen> {
                     child: CircularProgressIndicator(strokeWidth: 2),
                   )
                 : const Icon(Icons.refresh),
-            onPressed: _isLoading ? null : null,// _loadStatus,
+            onPressed: _isLoading ? null : _loadTelemetry,
             tooltip: 'Refresh',
           ),
         ],
@@ -132,7 +252,7 @@ class _TelemetryScreenState extends State<TelemetryScreen> {
       body: SafeArea(
         top: false,
         child: RefreshIndicator(
-          onRefresh: _loadStatus,
+          onRefresh: _loadTelemetry,
           child: ListView(
             padding: const EdgeInsets.all(16),
             children: [
