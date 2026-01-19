@@ -2,7 +2,7 @@
 """
 translate_arb_with_ollama.py
 
-Translates ARB/JSON localization values using a local Ollama model, while:
+Translates ARB/JSON localization values using a local Ollama or LM Studio model, while:
 - preserving keys
 - skipping "@@locale" and all "@key" metadata blocks
 - preserving placeholders like {deviceName}, {count, plural, ...}
@@ -10,29 +10,26 @@ Translates ARB/JSON localization values using a local Ollama model, while:
 - printing progress as it runs
 
 Usage:
-  # Translate all strings:
-  python translate_arb_with_ollama.py \
-    --in /home/zjs81/Desktop/meshcore-open/lib/l10n/app_en.arb \
-    --out /home/zjs81/Desktop/meshcore-open/lib/l10n/app_es.arb \
+  # Translate all strings with Ollama:
+  python translate.py \
+    --in /path/to/app_en.arb \
+    --out /path/to/app_es.arb \
     --to-locale es \
-    --model ministral-3:latest \
+    --model your-ollama-model \
     --temperature 0 \
     --concurrency 4
 
-  # Translate only missing/untranslated strings:
-  python translate_arb_with_ollama.py \
-    --in /home/zjs81/Desktop/meshcore-open/lib/l10n/app_en.arb \
-    --out /home/zjs81/Desktop/meshcore-open/lib/l10n/app_es.arb \
+  # Translate only missing strings with LM Studio:
+  python translate.py \
+    --in /path/to/app_en.arb \
+    --out /path/to/app_es.arb \
     --to-locale es \
     --missing-only \
-    --model ministral-3:latest
+    --lm-studio-host http://localhost:1234 \
+    --lm-studio-model your-lm-studio-model
 
   # Translate all locales (missing strings only):
-  python translate_arb_with_ollama.py \
-    --in /home/zjs81/Desktop/meshcore-open/lib/l10n/app_en.arb \
-    --l10n-dir /home/zjs81/Desktop/meshcore-open/lib/l10n \
-    --missing-only \
-    --model ministral-3:latest
+  python translate.py --in ../lib/l10n/app_en.arb --l10n-dir ../lib/l10n --missing-only --model your-ollama-model
 """
 
 from __future__ import annotations
@@ -47,12 +44,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple, Optional
 from urllib import request
+from urllib.error import HTTPError
 
 
 # Simple placeholder like {name}, {count}, {deviceName}
-SIMPLE_PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
+SIMPLE_PLACEHOLDER_RE = re.compile(r"{(\\w+)}")
 # ICU plural/select variable name extraction: {count, plural, ...} or {gender, select, ...}
-ICU_VAR_RE = re.compile(r"\{(\w+)\s*,\s*(?:plural|select|selectordinal)\s*,", re.IGNORECASE)
+ICU_VAR_RE = re.compile(r"{(\\w+)\s*,\s*(?:plural|select|selectordinal)\s*,", re.IGNORECASE)
 
 
 @dataclass
@@ -74,9 +72,13 @@ def http_post_json(url: str, payload: Dict[str, Any], timeout_s: float) -> Dict[
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with request.urlopen(req, timeout=timeout_s) as resp:
-        body = resp.read().decode("utf-8")
-        return json.loads(body)
+    try:
+        with request.urlopen(req, timeout=timeout_s) as resp:
+            body = resp.read().decode("utf-8")
+            return json.loads(body)
+    except Exception as e:
+        print(f"Error calling {url}: {e}", file=sys.stderr)
+        return {}
 
 
 def strip_markdown(s: str) -> str:
@@ -111,6 +113,48 @@ def ollama_generate(cfg: OllamaConfig, prompt: str) -> str:
     return out.strip()
 
 
+def lm_studio_generate(cfg: OllamaConfig, prompt: str) -> str:
+    url = cfg.host.rstrip("/") + "/v1/chat/completions"
+    payload = {
+        "model": cfg.model,
+        "messages": [
+            {"role": "system", "content": "You are a helpful translation assistant."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": cfg.temperature,
+    }
+    resp = http_post_json(url, payload, cfg.timeout_s)
+    out = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
+    # Clean up common LLM artifacts
+    out = strip_markdown(out)
+    return out.strip()
+
+
+def generate_translation(args, prompt: str) -> str:
+    if args.lm_studio_host:
+        cfg = OllamaConfig(
+            host=args.lm_studio_host,
+            model=args.lm_studio_model,
+            timeout_s=args.timeout,
+            temperature=args.temperature,
+            num_ctx=args.num_ctx,
+            num_predict=args.num_predict,
+            top_p=args.top_p,
+        )
+        return lm_studio_generate(cfg, prompt)
+    else:
+        cfg = OllamaConfig(
+            host=args.host,
+            model=args.model,
+            timeout_s=args.timeout,
+            temperature=args.temperature,
+            num_ctx=args.num_ctx,
+            num_predict=args.num_predict,
+            top_p=args.top_p,
+        )
+        return ollama_generate(cfg, prompt)
+
+
 def extract_placeholder_names(s: str) -> List[str]:
     """Extract placeholder variable names (not the full braced expression).
     
@@ -118,28 +162,10 @@ def extract_placeholder_names(s: str) -> List[str]:
     For '{count} {count, plural, =1{hop} other{hops}}' returns ['count']
     """
     names = set()
-    # Get ICU variable names first
-    for m in ICU_VAR_RE.finditer(s):
+    # Get all potential placeholder names
+    for m in re.finditer(r'\{(\w+)', s):
         names.add(m.group(1))
-    # Get simple placeholders, but skip if they're inside ICU blocks (text forms like {hop})
-    # We do this by checking if the name is also an ICU variable - if not, it's a simple placeholder
-    # unless it looks like a word (ICU text forms are usually short words)
-    for m in SIMPLE_PLACEHOLDER_RE.finditer(s):
-        name = m.group(1)
-        # Check if this appears as a simple {name} placeholder (not inside ICU)
-        # by looking at what comes after it
-        full_match = m.group(0)
-        pos = m.start()
-        # Look for pattern like {name, plural/select - if found, skip (handled by ICU_VAR_RE)
-        rest = s[pos:]
-        if re.match(r"\{\w+\s*,\s*(?:plural|select|selectordinal)", rest, re.IGNORECASE):
-            continue
-        # Check if this is likely a text form inside ICU (preceded by =X{ or other{)
-        before = s[:pos]
-        if re.search(r"(?:=\d+|zero|one|two|few|many|other)\s*$", before, re.IGNORECASE):
-            continue  # This is a text form like "=1{hop}", skip it
-        names.add(name)
-    return sorted(names)
+    return sorted(list(names))
 
 
 def build_prompt(text: str, target_lang: str, placeholder_names: List[str], has_icu: bool, ask_confidence: bool = False) -> str:
@@ -191,7 +217,7 @@ def build_prompt(text: str, target_lang: str, placeholder_names: List[str], has_
 
 
 def parse_confidence_response(response: str) -> Tuple[str, int]:
-    """Parse response with translation and confidence score.
+    """Parse response with translation and confidence score. 
     
     Returns (translation, confidence) where confidence is 1-5, or 0 if unparseable.
     """
@@ -239,7 +265,7 @@ def validate_preserved_tokens(src: str, out: str) -> Tuple[bool, Optional[str]]:
     # Check each placeholder name appears in output
     for name in src_names:
         # Look for {name} or {name, plural/select...}
-        pattern = r"\{" + re.escape(name) + r"(?:\}|\s*,)"
+        pattern = r"{" + re.escape(name) + r"(?:\}|\s*,)"
         if not re.search(pattern, out):
             return False, f"Missing placeholder: {{{name}}}"
     
@@ -355,13 +381,12 @@ def is_translatable_entry(key: str, value: Any) -> bool:
 
 
 def translate_one(
+    args,
     key: str,
     text: str,
     target_lang: str,
-    cfg: OllamaConfig,
     retries: int,
     backoff_s: float,
-    fallback_cfg: Optional[OllamaConfig] = None,
     confidence_threshold: float = 0.7,
     model_confidence_threshold: int = 4,
     ask_model_confidence: bool = True,
@@ -374,14 +399,14 @@ def translate_one(
     text_has_icu = has_icu_block(text)
     
     # Ask for confidence if we have a fallback model
-    should_ask_confidence = ask_model_confidence and fallback_cfg and fallback_cfg.model != cfg.model
+    should_ask_confidence = ask_model_confidence and args.fallback_model and args.fallback_model != args.model
     prompt = build_prompt(text, target_lang, placeholder_names, text_has_icu, ask_confidence=should_ask_confidence)
     used_fallback = False
 
     last_err: Optional[str] = None
     for attempt in range(retries + 1):
         try:
-            raw_out = ollama_generate(cfg, prompt)
+            raw_out = generate_translation(args, prompt)
             
             # Parse confidence if we asked for it
             if should_ask_confidence:
@@ -408,19 +433,21 @@ def translate_one(
                 continue
 
             # Check if model reported low confidence - use fallback
-            if model_confidence > 0 and model_confidence < model_confidence_threshold and fallback_cfg:
-                fallback_prompt = build_prompt(text, target_lang, placeholder_names, text_has_icu, ask_confidence=False)
-                fallback_out = ollama_generate(fallback_cfg, fallback_prompt)
+            if model_confidence > 0 and model_confidence < model_confidence_threshold and args.fallback_model:
+                fallback_args = argparse.Namespace(**vars(args))
+                fallback_args.model = args.fallback_model
+                fallback_out = generate_translation(fallback_args, prompt)
                 fallback_ok, _ = validate_preserved_tokens(text, fallback_out)
                 if fallback_ok and not looks_like_translation_failed(text, fallback_out):
                     return key, fallback_out, None, True
 
             # Also check computed confidence and use fallback model if needed
             confidence, issues = compute_confidence(text, out)
-            if confidence < confidence_threshold and fallback_cfg and fallback_cfg.model != cfg.model:
+            if confidence < confidence_threshold and args.fallback_model and args.fallback_model != args.model:
                 # Low confidence - try with bigger model
-                fallback_prompt = build_prompt(text, target_lang, placeholder_names, text_has_icu)
-                fallback_out = ollama_generate(fallback_cfg, fallback_prompt)
+                fallback_args = argparse.Namespace(**vars(args))
+                fallback_args.model = args.fallback_model
+                fallback_out = generate_translation(fallback_args, prompt)
                 fallback_ok, _ = validate_preserved_tokens(text, fallback_out)
                 fallback_conf, _ = compute_confidence(text, fallback_out)
                 
@@ -440,10 +467,11 @@ def translate_one(
                 continue
 
     # Last resort: try fallback model
-    if fallback_cfg and fallback_cfg.model != cfg.model:
+    if args.fallback_model and args.fallback_model != args.model:
         try:
-            fallback_prompt = build_prompt(text, target_lang, placeholder_names, text_has_icu)
-            fallback_out = ollama_generate(fallback_cfg, fallback_prompt)
+            fallback_args = argparse.Namespace(**vars(args))
+            fallback_args.model = args.fallback_model
+            fallback_out = generate_translation(fallback_args, prompt)
             fallback_ok, _ = validate_preserved_tokens(text, fallback_out)
             if fallback_ok and not looks_like_translation_failed(text, fallback_out):
                 return key, fallback_out, None, True
@@ -479,7 +507,7 @@ def find_missing_keys(source_data: Dict[str, Any], target_data: Dict[str, Any]) 
 
 
 def get_all_locale_files(l10n_dir: str, template_file: str) -> List[Tuple[str, str]]:
-    """Find all locale .arb files in the directory, excluding the template.
+    """Find all locale .arb files in the directory, excluding the template. 
     
     Returns list of (locale_code, file_path) tuples.
     """
@@ -500,7 +528,7 @@ def get_all_locale_files(l10n_dir: str, template_file: str) -> List[Tuple[str, s
     return sorted(locales)
 
 
-def main() -> int:
+def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--in", dest="in_path", required=True, help="Input .arb/.json file path (source/template)")
     ap.add_argument("--out", dest="out_path", default=None, help="Output .arb/.json file path (required unless using --l10n-dir)")
@@ -513,7 +541,9 @@ def main() -> int:
     ap.add_argument("--confidence-threshold", type=float, default=0.7, help="Computed confidence threshold to trigger fallback (0.0-1.0)")
     ap.add_argument("--model-confidence-threshold", type=int, default=4, help="Model self-reported confidence threshold (1-5, use fallback if below)")
     ap.add_argument("--retry-model", default="ministral-3:latest", help="Model to use for end-of-run retries")
-    ap.add_argument("--host", default="http://localhost:11434", help="Ollama host")
+    ap.add_argument("--host", default="http://localhost:1234", help="Ollama host")
+    ap.add_argument("--lm-studio-host", default=None, help="LM Studio host")
+    ap.add_argument("--lm-studio-model", default=None, help="LM Studio model name")
     ap.add_argument("--timeout", type=float, default=120.0, help="HTTP timeout seconds")
     ap.add_argument("--temperature", type=float, default=0.2, help="Model temperature")
     ap.add_argument("--num-ctx", type=int, default=4096, help="Context size")
@@ -524,8 +554,9 @@ def main() -> int:
     ap.add_argument("--backoff", type=float, default=0.6, help="Backoff seconds base")
     ap.add_argument("--dry-run", action="store_true", help="Do not write file; just print summary")
     ap.add_argument("--progress-every", type=int, default=1, help="Print progress every N completed strings (default: 1)")
-    args = ap.parse_args()
+    return ap.parse_args()
 
+def main(args) -> int:
     locale_map = {
         "es": "Spanish",
         "fr": "French",
@@ -671,29 +702,6 @@ def translate_locale(
 ) -> int:
     """Translate a single locale. Returns number of strings translated."""
     
-    cfg = OllamaConfig(
-        host=args.host,
-        model=args.model,
-        timeout_s=args.timeout,
-        temperature=args.temperature,
-        num_ctx=args.num_ctx,
-        num_predict=args.num_predict,
-        top_p=args.top_p,
-    )
-
-    # Fallback model for low-confidence translations
-    fallback_cfg = None
-    if args.fallback_model:
-        fallback_cfg = OllamaConfig(
-            host=args.host,
-            model=args.fallback_model,
-            timeout_s=args.timeout,
-            temperature=args.temperature,
-            num_ctx=args.num_ctx,
-            num_predict=args.num_predict,
-            top_p=args.top_p,
-        )
-
     # Start with target data (preserves existing translations) or source data
     if target_data:
         out_data: Dict[str, Any] = dict(target_data)
@@ -738,7 +746,7 @@ def translate_locale(
         print("All strings handled by manual translations.")
     else:
         fallback_info = f" (fallback: {args.fallback_model})" if args.fallback_model else ""
-        print(f"Translating {total} strings -> {target_lang} using {cfg.model}{fallback_info} (concurrency={args.concurrency})")
+        print(f"Translating {total} strings -> {target_lang} using {args.model}{fallback_info} (concurrency={args.concurrency})")
     
     start = time.time()
 
@@ -756,13 +764,12 @@ def translate_locale(
             future_to_key = {
                 ex.submit(
                     translate_one,
+                    args,
                     key=k,
                     text=v,
                     target_lang=target_lang,
-                    cfg=cfg,
                     retries=args.retries,
                     backoff_s=args.backoff,
-                    fallback_cfg=fallback_cfg,
                     confidence_threshold=args.confidence_threshold,
                     model_confidence_threshold=args.model_confidence_threshold,
                     ask_model_confidence=bool(args.fallback_model),
@@ -806,7 +813,7 @@ def translate_locale(
     retry_model = args.retry_model
     while failures and retry_round <= max_end_retries:
         # Increase temperature for each retry round
-        retry_temp = min(cfg.temperature + (0.2 * retry_round), 1.0)
+        retry_temp = min(args.temperature + (0.2 * retry_round), 1.0)
         print(f"\n--- Retry round {retry_round}/{max_end_retries} for {len(failures)} failed key(s) (model={retry_model}, temp={retry_temp:.1f}) ---")
         retry_items = [(k, items_dict[k]) for k, _ in failures]
         failures = []
@@ -815,24 +822,18 @@ def translate_locale(
         retry_start = time.time()
 
         # Create config with higher temperature (and optionally different model) for retries
-        retry_cfg = OllamaConfig(
-            host=cfg.host,
-            model=retry_model,
-            timeout_s=cfg.timeout_s,
-            temperature=retry_temp,
-            num_ctx=cfg.num_ctx,
-            num_predict=cfg.num_predict,
-            top_p=cfg.top_p,
-        )
+        retry_args = argparse.Namespace(**vars(args))
+        retry_args.model = retry_model
+        retry_args.temperature = retry_temp
 
         with ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as ex:
             future_to_key = {
                 ex.submit(
                     translate_one,
+                    retry_args,
                     key=k,
                     text=v,
                     target_lang=target_lang,
-                    cfg=retry_cfg,
                     retries=args.retries,
                     backoff_s=args.backoff,
                 ): k
@@ -891,4 +892,5 @@ def translate_locale(
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    args = parse_args()
+    raise SystemExit(main(args))
