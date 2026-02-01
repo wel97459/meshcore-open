@@ -12,8 +12,8 @@ Translates ARB/JSON localization values using a local Ollama model, while:
 Usage:
   # Translate all strings:
   python translate_arb_with_ollama.py \
-    --in /home/zjs81/Desktop/meshcore-open/lib/l10n/app_en.arb \
-    --out /home/zjs81/Desktop/meshcore-open/lib/l10n/app_es.arb \
+    --in ../lib/l10n/app_en.arb \
+    --out ../lib/l10n/app_es.arb \
     --to-locale es \
     --model ministral-3:latest \
     --temperature 0 \
@@ -21,22 +21,29 @@ Usage:
 
   # Translate only missing/untranslated strings:
   python translate_arb_with_ollama.py \
-    --in /home/zjs81/Desktop/meshcore-open/lib/l10n/app_en.arb \
-    --out /home/zjs81/Desktop/meshcore-open/lib/l10n/app_es.arb \
+    --in ../lib/l10n/app_en.arb \
+    --out ../lib/l10n/app_es.arb \
     --to-locale es \
     --missing-only \
     --model ministral-3:latest
 
   # Translate all locales (missing strings only):
   python translate_arb_with_ollama.py \
-    --in /home/zjs81/Desktop/meshcore-open/lib/l10n/app_en.arb \
-    --l10n-dir /home/zjs81/Desktop/meshcore-open/lib/l10n \
+    --in ../lib/l10n/app_en.arb \
+    --l10n-dir ../lib/l10n \
     --missing-only \
     --model ministral-3:latest
+
+  # Translate using Groq (very fast):
+    python translate_arb_with_ollama.py \
+    --in ../lib/l10n/app_en.arb 
+    --l10n-dir ../lib/l10n \
+    --missing-only \
+    --backend groq --model llama-3.3-70b-versatile \
+    --temperature 0.1 --concurrency 12
 """
 
 from __future__ import annotations
-
 import argparse
 import json
 import os
@@ -48,6 +55,11 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple, Optional
 from urllib import request
 
+try:
+    from groq import Groq
+    GROQ_AVAILABLE = True
+except ImportError:
+    GROQ_AVAILABLE = False
 
 # Simple placeholder like {name}, {count}, {deviceName}
 SIMPLE_PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
@@ -65,6 +77,13 @@ class OllamaConfig:
     num_predict: int
     top_p: float
 
+@dataclass
+class GroqConfig:
+    client: Groq
+    model: str
+    temperature: float
+    max_tokens: int          # Groq calls it max_tokens (not num_predict)
+    top_p: float
 
 def http_post_json(url: str, payload: Dict[str, Any], timeout_s: float) -> Dict[str, Any]:
     data = json.dumps(payload).encode("utf-8")
@@ -110,6 +129,24 @@ def ollama_generate(cfg: OllamaConfig, prompt: str) -> str:
     out = strip_markdown(out)
     return out.strip()
 
+def groq_generate(cfg: GroqConfig, prompt: str) -> str:
+    try:
+        response = cfg.client.chat.completions.create(
+            model=cfg.model,
+            messages=[
+                {"role": "user", "content": prompt},
+            ],
+            temperature=cfg.temperature,
+            max_tokens=cfg.max_tokens,
+            top_p=cfg.top_p,
+            stream=False,
+        )
+        out = response.choices[0].message.content or ""
+        out = strip_markdown(out)
+        return out.strip()
+
+    except Exception as e:
+        raise RuntimeError(f"Groq API error: {str(e)}") from e
 
 def extract_placeholder_names(s: str) -> List[str]:
     """Extract placeholder variable names (not the full braced expression).
@@ -358,10 +395,12 @@ def translate_one(
     key: str,
     text: str,
     target_lang: str,
-    cfg: OllamaConfig,
+    generate_fn,                # ← new: callable that takes config & prompt → str
+    config,                     # ← either OllamaConfig or GroqConfig
     retries: int,
     backoff_s: float,
-    fallback_cfg: Optional[OllamaConfig] = None,
+    fallback_generate_fn=None,
+    fallback_config=None,
     confidence_threshold: float = 0.7,
     model_confidence_threshold: int = 4,
     ask_model_confidence: bool = True,
@@ -374,14 +413,14 @@ def translate_one(
     text_has_icu = has_icu_block(text)
     
     # Ask for confidence if we have a fallback model
-    should_ask_confidence = ask_model_confidence and fallback_cfg and fallback_cfg.model != cfg.model
+    should_ask_confidence = ask_model_confidence and fallback_config and fallback_config.model != config.model
     prompt = build_prompt(text, target_lang, placeholder_names, text_has_icu, ask_confidence=should_ask_confidence)
     used_fallback = False
 
     last_err: Optional[str] = None
     for attempt in range(retries + 1):
         try:
-            raw_out = ollama_generate(cfg, prompt)
+            raw_out = generate_fn(config, prompt)
             
             # Parse confidence if we asked for it
             if should_ask_confidence:
@@ -408,19 +447,19 @@ def translate_one(
                 continue
 
             # Check if model reported low confidence - use fallback
-            if model_confidence > 0 and model_confidence < model_confidence_threshold and fallback_cfg:
+            if model_confidence > 0 and model_confidence < model_confidence_threshold and fallback_config:
                 fallback_prompt = build_prompt(text, target_lang, placeholder_names, text_has_icu, ask_confidence=False)
-                fallback_out = ollama_generate(fallback_cfg, fallback_prompt)
+                fallback_out = generate_fn(fallback_config, fallback_prompt)
                 fallback_ok, _ = validate_preserved_tokens(text, fallback_out)
                 if fallback_ok and not looks_like_translation_failed(text, fallback_out):
                     return key, fallback_out, None, True
 
             # Also check computed confidence and use fallback model if needed
             confidence, issues = compute_confidence(text, out)
-            if confidence < confidence_threshold and fallback_cfg and fallback_cfg.model != cfg.model:
+            if confidence < confidence_threshold and fallback_config and fallback_config.model != config.model:
                 # Low confidence - try with bigger model
                 fallback_prompt = build_prompt(text, target_lang, placeholder_names, text_has_icu)
-                fallback_out = ollama_generate(fallback_cfg, fallback_prompt)
+                fallback_out = generate_fn(fallback_config, fallback_prompt)
                 fallback_ok, _ = validate_preserved_tokens(text, fallback_out)
                 fallback_conf, _ = compute_confidence(text, fallback_out)
                 
@@ -440,10 +479,10 @@ def translate_one(
                 continue
 
     # Last resort: try fallback model
-    if fallback_cfg and fallback_cfg.model != cfg.model:
+    if fallback_config and fallback_config.model != config.model:
         try:
             fallback_prompt = build_prompt(text, target_lang, placeholder_names, text_has_icu)
-            fallback_out = ollama_generate(fallback_cfg, fallback_prompt)
+            fallback_out = generate_fn(fallback_config, fallback_prompt)
             fallback_ok, _ = validate_preserved_tokens(text, fallback_out)
             if fallback_ok and not looks_like_translation_failed(text, fallback_out):
                 return key, fallback_out, None, True
@@ -511,11 +550,15 @@ def main() -> int:
     ap.add_argument("--l10n-dir", default=None, help="Directory containing locale .arb files. When set, translates all locales.")
     ap.add_argument("--missing-only", action="store_true", help="Only translate keys missing from target file")
     ap.add_argument("--target-lang", default=None, help="Target language name for the model, e.g. Spanish (defaults from locale)")
-    ap.add_argument("--model", default="gemma3:4b", help="Ollama model name")
+    ap.add_argument("--model", default="gemma3:4b", help="Ollama model name (or Groq model when --backend=groq)")
+    ap.add_argument("--backend", choices=["ollama", "groq"], default="ollama",
+                    help="Inference backend to use")
+    ap.add_argument("--groq-api-key", default=None,
+                    help="Groq API key (can also be set via GROQ_API_KEY env var)")
     ap.add_argument("--fallback-model", default=None, help="Larger model to use for low-confidence translations")
     ap.add_argument("--confidence-threshold", type=float, default=0.7, help="Computed confidence threshold to trigger fallback (0.0-1.0)")
     ap.add_argument("--model-confidence-threshold", type=int, default=4, help="Model self-reported confidence threshold (1-5, use fallback if below)")
-    ap.add_argument("--retry-model", default="ministral-3:latest", help="Model to use for end-of-run retries")
+    ap.add_argument("--retry-model", default=None, help="Model to use for end-of-run retries")
     ap.add_argument("--host", default="http://localhost:11434", help="Ollama host")
     ap.add_argument("--timeout", type=float, default=120.0, help="HTTP timeout seconds")
     ap.add_argument("--temperature", type=float, default=0.2, help="Model temperature")
@@ -674,28 +717,58 @@ def translate_locale(
 ) -> int:
     """Translate a single locale. Returns number of strings translated."""
     
-    cfg = OllamaConfig(
-        host=args.host,
-        model=args.model,
-        timeout_s=args.timeout,
-        temperature=args.temperature,
-        num_ctx=args.num_ctx,
-        num_predict=args.num_predict,
-        top_p=args.top_p,
-    )
+    if args.backend == "groq":
+        if not GROQ_AVAILABLE:
+            print("Error: Groq backend requested but 'groq' package is not installed.", file=sys.stderr)
+            print("Run:  pip install groq", file=sys.stderr)
+            return -1
 
-    # Fallback model for low-confidence translations
-    fallback_cfg = None
-    if args.fallback_model:
-        fallback_cfg = OllamaConfig(
+        api_key = args.groq_api_key or os.environ.get("GROQ_API_KEY")
+        if not api_key:
+            print("Error: --groq-api-key or GROQ_API_KEY environment variable is required", file=sys.stderr)
+            return 1
+
+        client = Groq(api_key=api_key)
+
+        cfg = GroqConfig(
+            client=client,
+            model=args.model,
+            temperature=args.temperature,
+            max_tokens=args.num_predict,       # reusing the same flag
+            top_p=args.top_p,
+        )
+        generate_fn = groq_generate
+
+        fallback_cfg = None
+        fallback_generate_fn = None
+        if args.fallback_model:
+            print("Warning: --fallback-model not yet supported with Groq backend", file=sys.stderr)
+
+    else:  # ollama
+        cfg = OllamaConfig(
             host=args.host,
-            model=args.fallback_model,
+            model=args.model,
             timeout_s=args.timeout,
             temperature=args.temperature,
             num_ctx=args.num_ctx,
             num_predict=args.num_predict,
             top_p=args.top_p,
         )
+        generate_fn = ollama_generate
+
+        fallback_cfg = None
+        fallback_generate_fn = None
+        if args.fallback_model:
+            fallback_cfg = OllamaConfig(
+                host=args.host,
+                model=args.fallback_model,
+                timeout_s=args.timeout,
+                temperature=args.temperature,
+                num_ctx=args.num_ctx,
+                num_predict=args.num_predict,
+                top_p=args.top_p,
+            )
+            fallback_generate_fn = ollama_generate
 
     # Start with target data (preserves existing translations) or source data
     if target_data:
@@ -757,15 +830,17 @@ def translate_locale(
     if total > 0:
         with ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as ex:
             future_to_key = {
-                ex.submit(
+            ex.submit(
                     translate_one,
                     key=k,
                     text=v,
                     target_lang=target_lang,
-                    cfg=cfg,
+                    generate_fn=generate_fn,
+                    config=cfg,
                     retries=args.retries,
                     backoff_s=args.backoff,
-                    fallback_cfg=fallback_cfg,
+                    fallback_generate_fn=fallback_generate_fn,
+                    fallback_config=fallback_cfg,
                     confidence_threshold=args.confidence_threshold,
                     model_confidence_threshold=args.model_confidence_threshold,
                     ask_model_confidence=bool(args.fallback_model),
@@ -806,7 +881,8 @@ def translate_locale(
     # Retry failed translations at the end with increasing temperature
     retry_round = 1
     max_end_retries = 3
-    retry_model = args.retry_model
+    retry_model = args.retry_model or args.model
+
     while failures and retry_round <= max_end_retries:
         # Increase temperature for each retry round
         retry_temp = min(cfg.temperature + (0.2 * retry_round), 1.0)
@@ -816,18 +892,26 @@ def translate_locale(
         retry_completed = 0
         retry_total = len(retry_items)
         retry_start = time.time()
-
-        # Create config with higher temperature (and optionally different model) for retries
-        retry_cfg = OllamaConfig(
-            host=cfg.host,
-            model=retry_model,
-            timeout_s=cfg.timeout_s,
-            temperature=retry_temp,
-            num_ctx=cfg.num_ctx,
-            num_predict=cfg.num_predict,
-            top_p=cfg.top_p,
-        )
-
+        if args.backend == "groq":
+            retry_cfg = GroqConfig(
+                client=cfg.client,
+                model=retry_model,
+                temperature=retry_temp,
+                max_tokens=cfg.max_tokens,
+                top_p=cfg.top_p,
+            )
+            retry_generate_fn = groq_generate
+        else:
+            retry_cfg = OllamaConfig(
+                host=cfg.host,
+                model=retry_model,
+                timeout_s=cfg.timeout_s,
+                temperature=retry_temp,
+                num_ctx=cfg.num_ctx,
+                num_predict=cfg.num_predict,
+                top_p=cfg.top_p,
+            )
+            retry_generate_fn = ollama_generate 
         with ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as ex:
             future_to_key = {
                 ex.submit(
@@ -835,7 +919,8 @@ def translate_locale(
                     key=k,
                     text=v,
                     target_lang=target_lang,
-                    cfg=retry_cfg,
+                    config=retry_cfg,
+                    generate_fn=retry_generate_fn,
                     retries=args.retries,
                     backoff_s=args.backoff,
                 ): k
